@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/iam/credentials/apiv1/credentialspb"
 	"github.com/googleapis/gax-go/v2"
@@ -47,6 +48,7 @@ type workloadIdentityTest struct {
 	genSAToken     func(c context.Context, s1 []string, s2, s3 string) (*authv1.TokenRequest, error)
 	store          esv1beta1.GenericStore
 	kubeObjects    []client.Object
+	cachingTest    bool
 }
 
 func TestWorkloadIdentity(t *testing.T) {
@@ -134,6 +136,13 @@ func TestWorkloadIdentity(t *testing.T) {
 				},
 			}),
 		),
+		composeTestcase(
+			defaultTestCase("should cache and reuse tokens"),
+			withStore(defaultStore()),
+			expTokenSource(),
+			expectToken(defaultGenAccessToken),
+			withCachingBehavior(),
+		),
 	}
 
 	for _, row := range tbl {
@@ -165,11 +174,32 @@ func TestWorkloadIdentity(t *testing.T) {
 					assert.NoError(t, err)
 					assert.EqualValues(t, tk, row.expToken)
 				}
+				
+				if row.cachingTest {
+					testCachingBehavior(t, ts, row.genAccessToken)
+				}
 			} else {
 				assert.Nil(t, ts)
 			}
 		})
 	}
+}
+
+func testCachingBehavior(t *testing.T, ts oauth2.TokenSource, genAccessToken func(context.Context, *credentialspb.GenerateAccessTokenRequest, ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error)) {
+	// First call should generate a new token
+	token1, err := ts.Token()
+	assert.NoError(t, err)
+	assert.Equal(t, defaultGenAccessToken, token1.AccessToken)
+
+	// Second call should return the same token without calling genAccessToken
+	token2, err := ts.Token()
+	assert.NoError(t, err)
+	assert.Equal(t, token1.AccessToken, token2.AccessToken)
+
+	// Verify that genAccessToken was only called once
+	fakeIam, ok := ts.(*cachingTokenSource)
+	assert.True(t, ok)
+	assert.Equal(t, 1, fakeIam.callCount)
 }
 
 func TestClusterProjectID(t *testing.T) {
@@ -255,6 +285,19 @@ func expErr(err string) testCaseMutator {
 func withK8sResources(objs []client.Object) testCaseMutator {
 	return func(tc *workloadIdentityTest) {
 		tc.kubeObjects = objs
+	}
+}
+
+func withCachingBehavior() testCaseMutator {
+	return func(tc *workloadIdentityTest) {
+		tc.cachingTest = true
+		callCount := 0
+		tc.genAccessToken = func(c context.Context, gatr *credentialspb.GenerateAccessTokenRequest, co ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error) {
+			callCount++
+			return &credentialspb.GenerateAccessTokenResponse{
+				AccessToken: defaultGenAccessToken,
+			}, nil
+		}
 	}
 }
 
@@ -397,9 +440,11 @@ func (g *fakeIDBindTokenGen) Generate(ctx context.Context, client *http.Client, 
 // fake IAM Client.
 type fakeIAMClient struct {
 	generateAccessTokenFunc func(context.Context, *credentialspb.GenerateAccessTokenRequest, ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error)
+	callCount               int
 }
 
 func (f *fakeIAMClient) GenerateAccessToken(ctx context.Context, req *credentialspb.GenerateAccessTokenRequest, opts ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error) {
+	f.callCount++
 	return f.generateAccessTokenFunc(ctx, req, opts...)
 }
 
@@ -439,4 +484,25 @@ func (ma *fakeK8sV1SA) CreateToken(
 ) (*authv1.TokenRequest, error) {
 	tokenRequest.Status.Token = defaultSAToken
 	return tokenRequest, nil
+}
+
+type cachingTokenSource struct {
+	source    oauth2.TokenSource
+	token     *oauth2.Token
+	callCount int
+}
+
+func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
+	if c.token != nil && c.token.Valid() {
+		return c.token, nil
+	}
+
+	c.callCount++
+	newToken, err := c.source.Token()
+	if err != nil {
+		return nil, err
+	}
+
+	c.token = newToken
+	return newToken, nil
 }
