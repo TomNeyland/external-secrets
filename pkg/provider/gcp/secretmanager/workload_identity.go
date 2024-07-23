@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	iam "cloud.google.com/go/iam/credentials/apiv1"
@@ -55,8 +56,6 @@ const (
 	errNoProjectID    = "unable to find ProjectID in storeSpec"
 )
 
-// workloadIdentity holds all clients and generators needed
-// to create a gcp oauth token.
 type workloadIdentity struct {
 	iamClient            IamClient
 	idBindTokenGenerator idBindTokenGenerator
@@ -64,18 +63,15 @@ type workloadIdentity struct {
 	clusterProjectID     string
 }
 
-// interface to GCP IAM API.
 type IamClient interface {
 	GenerateAccessToken(ctx context.Context, req *credentialspb.GenerateAccessTokenRequest, opts ...gax.CallOption) (*credentialspb.GenerateAccessTokenResponse, error)
 	Close() error
 }
 
-// interface to securetoken/identitybindingtoken API.
 type idBindTokenGenerator interface {
 	Generate(context.Context, *http.Client, string, string, string) (*oauth2.Token, error)
 }
 
-// interface to kubernetes serviceaccount token request API.
 type saTokenGenerator interface {
 	Generate(context.Context, []string, string, string) (*authenticationv1.TokenRequest, error)
 }
@@ -95,6 +91,25 @@ func newWorkloadIdentity(ctx context.Context, projectID string) (*workloadIdenti
 		saTokenGenerator:     satg,
 		clusterProjectID:     projectID,
 	}, nil
+}
+
+type cachingTokenSource struct {
+	mu     sync.Mutex
+	token  *oauth2.Token
+	source func() (*oauth2.Token, error)
+}
+
+func (cts *cachingTokenSource) Token() (*oauth2.Token, error) {
+	cts.mu.Lock()
+	defer cts.mu.Unlock()
+	if cts.token == nil || cts.token.Expiry.Before(time.Now()) {
+		newToken, err := cts.source()
+		if err != nil {
+			return nil, err
+		}
+		cts.token = newToken
+	}
+	return cts.token, nil
 }
 
 func (w *workloadIdentity) TokenSource(ctx context.Context, auth esv1beta1.GCPSMAuth, isClusterKind bool, kube kclient.Client, namespace string) (oauth2.TokenSource, error) {
@@ -129,35 +144,40 @@ func (w *workloadIdentity) TokenSource(ctx context.Context, auth esv1beta1.GCPSM
 	}
 	gcpSA := sa.Annotations[gcpSAAnnotation]
 
-	resp, err := w.saTokenGenerator.Generate(ctx, audiences, saKey.Name, saKey.Namespace)
-	metrics.ObserveAPICall(constants.ProviderGCPSM, constants.CallGCPSMGenerateSAToken, err)
-	if err != nil {
-		return nil, fmt.Errorf(errFetchPodToken, err)
-	}
+	return &cachingTokenSource{
+		source: func() (*oauth2.Token, error) {
+			resp, err := w.saTokenGenerator.Generate(ctx, audiences, saKey.Name, saKey.Namespace)
+			metrics.ObserveAPICall(constants.ProviderGCPSM, constants.CallGCPSMGenerateSAToken, err)
+			if err != nil {
+				return nil, fmt.Errorf(errFetchPodToken, err)
+			}
 
-	idBindToken, err := w.idBindTokenGenerator.Generate(ctx, http.DefaultClient, resp.Status.Token, idPool, idProvider)
-	metrics.ObserveAPICall(constants.ProviderGCPSM, constants.CallGCPSMGenerateIDBindToken, err)
-	if err != nil {
-		return nil, fmt.Errorf(errFetchIBToken, err)
-	}
+			idBindToken, err := w.idBindTokenGenerator.Generate(ctx, http.DefaultClient, resp.Status.Token, idPool, idProvider)
+			metrics.ObserveAPICall(constants.ProviderGCPSM, constants.CallGCPSMGenerateIDBindToken, err)
+			if err != nil {
+				return nil, fmt.Errorf(errFetchIBToken, err)
+			}
 
-	// If no `iam.gke.io/gcp-service-account` annotation is present the
-	// identitybindingtoken will be used directly, allowing bindings on secrets
-	// of the form "serviceAccount:<project>.svc.id.goog[<namespace>/<sa>]".
-	if gcpSA == "" {
-		return oauth2.StaticTokenSource(idBindToken), nil
-	}
-	gcpSAResp, err := w.iamClient.GenerateAccessToken(ctx, &credentialspb.GenerateAccessTokenRequest{
-		Name:  fmt.Sprintf("projects/-/serviceAccounts/%s", gcpSA),
-		Scope: secretmanager.DefaultAuthScopes(),
-	}, gax.WithGRPCOptions(grpc.PerRPCCredentials(oauth.TokenSource{TokenSource: oauth2.StaticTokenSource(idBindToken)})))
-	metrics.ObserveAPICall(constants.ProviderGCPSM, constants.CallGCPSMGenerateAccessToken, err)
-	if err != nil {
-		return nil, fmt.Errorf(errGenAccessToken, err)
-	}
-	return oauth2.StaticTokenSource(&oauth2.Token{
-		AccessToken: gcpSAResp.GetAccessToken(),
-	}), nil
+			// If no `iam.gke.io/gcp-service-account` annotation is present the
+			// identitybindingtoken will be used directly, allowing bindings on secrets
+			// of the form "serviceAccount:<project>.svc.id.goog[<namespace>/<sa>]".
+			if gcpSA == "" {
+				return idBindToken, nil
+			}
+			gcpSAResp, err := w.iamClient.GenerateAccessToken(ctx, &credentialspb.GenerateAccessTokenRequest{
+				Name:  fmt.Sprintf("projects/-/serviceAccounts/%s", gcpSA),
+				Scope: secretmanager.DefaultAuthScopes(),
+			}, gax.WithGRPCOptions(grpc.PerRPCCredentials(oauth.TokenSource{TokenSource: oauth2.StaticTokenSource(idBindToken)})))
+			metrics.ObserveAPICall(constants.ProviderGCPSM, constants.CallGCPSMGenerateAccessToken, err)
+			if err != nil {
+				return nil, fmt.Errorf(errGenAccessToken, err)
+			}
+			return &oauth2.Token{
+				AccessToken: gcpSAResp.GetAccessToken(),
+				Expiry:      time.Now().Add(time.Hour), // Set an appropriate expiry
+			}, nil
+		},
+	}, nil
 }
 
 func (w *workloadIdentity) Close() error {
@@ -215,7 +235,6 @@ func newSATokenGenerator() (saTokenGenerator, error) {
 	}, nil
 }
 
-// Trades the kubernetes token for an identitybindingtoken token.
 type gcpIDBindTokenGenerator struct {
 	targetURL string
 }
